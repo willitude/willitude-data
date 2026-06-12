@@ -174,10 +174,14 @@ You can safely delete subdirectories to free space. The server will re-download 
 
 | Variable                        | Purpose                                      | Example                              |
 |--------------------------------|----------------------------------------------|--------------------------------------|
-| `WILLITUDE_CACHE_DIR`          | Override cache root                          | `/Volumes/data/willitude-cache`     |
+| `WILLITUDE_CACHE_DIR`          | Override cache root (local working copy)     | `/Volumes/data/willitude-cache`     |
+| `WILLITUDE_S3_CACHE_BUCKET`    | Enable S3 global cache (e.g. willitude-data-cache in ap-northeast-1). Enables read-through/write-through for cross-machine sharing (notebook + canary). | `willitude-data-cache` |
+| `WILLITUDE_S3_CACHE_PREFIX`    | Prefix under the bucket (default willitude-data) | `willitude-data` |
 | `AWS_PROFILE`                  | AWS profile (SSO)                            | `YongseokMacProfile`                 |
-| `AWS_REGION` / `WILLITUDE_AWS_REGION` | Region for SSM                        | `ap-northeast-1`                     |
+| `AWS_REGION` / `WILLITUDE_AWS_REGION` | Region for SSM and S3 client             | `ap-northeast-1` (Tokyo recommended) |
 | `WILLITUDE_CONVERT_TARDIS_PARQUET` | `0` to disable auto parquet conversion | `1` (default)                        |
+
+When S3 is enabled, `ensure_*` will check S3 first (download to local working copy if present), fetch from provider only for missing, then upload to S3. Bars are always synced to S3. Manifest records S3 keys.
 
 ## Running on AWS
 

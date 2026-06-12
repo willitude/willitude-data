@@ -12,10 +12,23 @@ class WillitudeConfig(BaseModel):
     """Central configuration loaded from env + sensible defaults."""
 
     # Cache location. Can be set via WILLITUDE_CACHE_DIR env.
+    # For S3-based (recommended for remote/authenticated use, consistent with other willitude MCPs):
+    # Set WILLITUDE_S3_CACHE_BUCKET (and optional WILLITUDE_S3_CACHE_PREFIX="willitude-data").
+    # Then the global cache lives in S3 (Seoul), and materialize downloads to project as needed.
     cache_dir: Path = Field(
         default_factory=lambda: Path.home() / ".willitude" / "willitude-data",
         description="Root directory for all cached market data (Parquet/CSV etc). "
-        "Default: ~/.willitude/willitude-data/ (contains tardis/, databento/, manifest.jsonl).",
+        "Default: ~/.willitude/willitude-data/ (contains tardis/, databento/, manifest.jsonl). "
+        "For S3: set WILLITUDE_S3_CACHE_BUCKET to use S3 Seoul as global cache (no local ~/.willitude needed in remote).",
+    )
+
+    s3_cache_bucket: str | None = Field(
+        default_factory=lambda: os.getenv("WILLITUDE_S3_CACHE_BUCKET"),
+        description="S3 bucket for global cache (Seoul). If set, cache is S3-based for consistency with willitude-knowledge/trace.",
+    )
+    s3_cache_prefix: str = Field(
+        default="willitude-data",
+        description="Prefix in the S3 bucket for the cache (tardis/ and databento/ under this).",
     )
 
     # AWS
@@ -56,6 +69,9 @@ class WillitudeConfig(BaseModel):
         aws_profile = os.getenv("AWS_PROFILE") or os.getenv("WILLITUDE_AWS_PROFILE")
         aws_region = os.getenv("AWS_REGION") or os.getenv("WILLITUDE_AWS_REGION")
 
+        s3_bucket = os.getenv("WILLITUDE_S3_CACHE_BUCKET")
+        s3_prefix = os.getenv("WILLITUDE_S3_CACHE_PREFIX", "willitude-data")
+
         convert = os.getenv("WILLITUDE_CONVERT_TARDIS_PARQUET", "1").lower() not in {
             "0",
             "false",
@@ -66,6 +82,8 @@ class WillitudeConfig(BaseModel):
             cache_dir=Path(cache_dir).expanduser().resolve() if cache_dir else cls.model_fields["cache_dir"].default,
             aws_profile=aws_profile,
             aws_region=aws_region or "ap-northeast-1",
+            s3_cache_bucket=s3_bucket,
+            s3_cache_prefix=s3_prefix,
             convert_tardis_to_parquet=convert,
         )
 

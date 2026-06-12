@@ -93,7 +93,36 @@ class TardisDataClient:
                     )
                     continue
 
-                # Compute minimal contiguous missing blocks to avoid re-downloading known days
+                # S3 read-through: if S3 enabled, first try to pull existing shards for this symbol/type
+                # This enables cross-machine sharing (notebook <-> canary) without re-download from provider.
+                if self.cache.is_s3():
+                    s3_prefix = self.cache.s3_tardis_key(exchange, symbol, dtype, raw=True)
+                    self.cache.download_from_s3_prefix(s3_prefix, raw_dir)
+                    # re-evaluate after pull
+                    available = self.cache.get_tardis_available_dates(exchange, symbol, dtype)
+                    missing = self.cache.compute_missing_dates(from_date, to_date, available)
+
+                if not missing and not force:
+                    logger.info(
+                        "Tardis smart cache hit (restored from S3): %s %s %s — all %s..%s days present",
+                        exchange, symbol, dtype, from_date, to_date
+                    )
+                    results.append(
+                        {
+                            "exchange": exchange,
+                            "symbol": symbol,
+                            "data_type": dtype,
+                            "status": "restored_from_s3" if self.cache.is_s3() else "cached",
+                            "raw_dir": str(raw_dir),
+                            "files": len(list(raw_dir.glob("*.csv*")) + list(raw_dir.glob("*.gz"))),
+                            "unified_parquet": str(unified) if unified.exists() else None,
+                            "missing_days": 0,
+                            "s3_synced": self.cache.is_s3(),
+                        }
+                    )
+                    continue
+
+                # (re)compute minimal contiguous missing blocks (after possible S3 pull)
                 ranges = self.cache.group_into_ranges(missing) if missing else [(from_date, to_date)]
 
                 logger.info(
@@ -138,6 +167,30 @@ class TardisDataClient:
                             )
                         except Exception as exc2:
                             logger.error("Tardis fallback also failed: %s", exc2)
+
+                # S3 write-through: after provider download (or if no download needed but we want to ensure local is in sync?),
+                # upload the (updated) raw dir to S3 so other machines can read-through later.
+                if self.cache.is_s3():
+                    s3_prefix = self.cache.s3_tardis_key(exchange, symbol, dtype, raw=True)
+                    self.cache.upload_to_s3(raw_dir, s3_prefix)
+                    # Also record S3 key in manifest for traceability
+                    try:
+                        s3_entry = CacheEntry(
+                            provider="tardis",
+                            path=str(raw_dir),
+                            size_bytes=0,
+                            created_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+                            meta={
+                                "exchange": exchange,
+                                "symbol": symbol,
+                                "data_type": dtype,
+                                "s3_key": s3_prefix,
+                                "s3_bucket": get_config().s3_cache_bucket,
+                            },
+                        )
+                        self.cache.record_download(s3_entry)
+                    except Exception:
+                        pass
 
                 # Post-process: count + optional convert to single parquet for convenience
                 files_after = list(raw_dir.glob("**/*")) if raw_dir.exists() else []
@@ -285,6 +338,9 @@ class TardisDataClient:
             available = self.cache.get_tardis_bar_available_dates(exchange, symbol, freq)
             missing = self.cache.compute_missing_dates(from_date, to_date, available)
             if not missing and not force:
+                if not keep_raw:
+                    for day in self.cache._date_range(from_date, to_date):
+                        self._cleanup_raw_for_day(exchange, symbol, data_types, day)
                 results.append({
                     "exchange": exchange,
                     "symbol": symbol,
@@ -300,11 +356,56 @@ class TardisDataClient:
                 days = self.cache._date_range(rstart, rend)
                 for day in days:
                     try:
+                        bar_path = self.cache.tardis_bar_path(exchange, symbol, freq, day)
+                        s3_key = self.cache.s3_tardis_bar_key(exchange, symbol, freq, day) if self.cache.is_s3() else None
+
+                        # S3 read-through for bar
+                        if s3_key:
+                            self.cache.download_from_s3(s3_key, bar_path)
+
+                        if bar_path.exists() and not force:
+                            # already have (from S3 or previous)
+                            if not keep_raw:
+                                self._cleanup_raw_for_day(exchange, symbol, data_types, day)
+                            results.append({
+                                "exchange": exchange,
+                                "symbol": symbol,
+                                "freq": freq,
+                                "day": day,
+                                "status": "cached_from_s3" if s3_key else "cached",
+                                "rows": 0,  # unknown without loading
+                            })
+                            continue
+
                         bar_df = self._build_bar_for_day(exchange, symbol, day, freq)
                         if bar_df is not None and len(bar_df) > 0:
-                            out_path = self.cache.tardis_bar_path(exchange, symbol, freq, day)
-                            out_path.parent.mkdir(parents=True, exist_ok=True)
-                            bar_df.write_parquet(out_path, compression="zstd")
+                            bar_path.parent.mkdir(parents=True, exist_ok=True)
+                            bar_df.write_parquet(bar_path, compression="zstd")
+
+                            # S3 write-through for bar (bars are small, always keep in sync)
+                            if s3_key:
+                                self.cache.upload_to_s3(bar_path, s3_key)
+
+                            # Record bar with S3 key in manifest for traceability
+                            if s3_key:
+                                try:
+                                    bar_entry = CacheEntry(
+                                        provider="tardis_bars",
+                                        path=str(bar_path),
+                                        size_bytes=bar_path.stat().st_size if bar_path.exists() else 0,
+                                        created_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+                                        meta={
+                                            "exchange": exchange,
+                                            "symbol": symbol,
+                                            "freq": freq,
+                                            "day": day,
+                                            "s3_key": s3_key,
+                                            "s3_bucket": get_config().s3_cache_bucket,
+                                        },
+                                    )
+                                    self.cache.record_download(bar_entry)
+                                except Exception:
+                                    pass
 
                             if not keep_raw:
                                 # Clean raw for this day if requested
@@ -317,6 +418,7 @@ class TardisDataClient:
                                 "day": day,
                                 "status": "built",
                                 "rows": len(bar_df),
+                                "s3_key": s3_key or None,
                             })
                         else:
                             results.append({

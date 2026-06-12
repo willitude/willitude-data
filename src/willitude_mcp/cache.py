@@ -55,6 +55,96 @@ class CacheManager:
         (self.root / "tardis").mkdir(exist_ok=True)
         (self.root / "databento").mkdir(exist_ok=True)
 
+    def is_s3(self) -> bool:
+        cfg = get_config()
+        return bool(cfg.s3_cache_bucket)
+
+    def s3_tardis_key(self, exchange: str, symbol: str, data_type: str, *, raw: bool = True) -> str:
+        if not self.is_s3():
+            return ""
+        prefix = get_config().s3_cache_prefix
+        base = f"{prefix}/tardis/{self._safe(exchange)}/{self._safe(symbol)}/{self._safe(data_type)}"
+        return f"{base}/raw" if raw else base
+
+    def s3_databento_key(self, dataset: str, symbol: str, schema: str, day: str | None = None) -> str:
+        if not self.is_s3():
+            return ""
+        prefix = get_config().s3_cache_prefix
+        base = f"{prefix}/databento/{self._safe(dataset)}/{self._safe(symbol)}/{self._safe(schema)}"
+        if day:
+            return f"{base}/{day}.parquet"
+        return base
+
+    def s3_tardis_bar_key(self, exchange: str, symbol: str, freq: str, day: str) -> str:
+        if not self.is_s3():
+            return ""
+        prefix = get_config().s3_cache_prefix
+        return f"{prefix}/tardis_bars/{self._safe(exchange)}/{self._safe(symbol)}/{self._safe(freq)}/{day}.parquet"
+
+    def upload_to_s3(self, local_path: Path, s3_key: str) -> None:
+        if not self.is_s3() or not local_path.exists():
+            return
+        try:
+            import boto3
+        except ImportError:
+            logger.warning("boto3 not installed; S3 upload skipped")
+            return
+        cfg = get_config()
+        s3 = boto3.client("s3", region_name=cfg.aws_region)
+        if local_path.is_file():
+            s3.upload_file(str(local_path), cfg.s3_cache_bucket, s3_key)
+        else:
+            for f in local_path.rglob("*"):
+                if f.is_file():
+                    rel = f.relative_to(local_path)
+                    key = f"{s3_key}/{rel}"
+                    s3.upload_file(str(f), cfg.s3_cache_bucket, key)
+
+    def download_from_s3(self, s3_key: str, local_path: Path) -> None:
+        if not self.is_s3():
+            return
+        try:
+            import boto3
+        except ImportError:
+            logger.warning("boto3 not installed; S3 download skipped")
+            return
+        cfg = get_config()
+        s3 = boto3.client("s3", region_name=cfg.aws_region)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            s3.download_file(cfg.s3_cache_bucket, s3_key, str(local_path))
+        except Exception:
+            # not found or error, ignore for now
+            pass
+
+    def download_from_s3_prefix(self, s3_prefix: str, local_dir: Path) -> None:
+        """Download all objects under s3_prefix into local_dir (preserves relative structure)."""
+        if not self.is_s3() or not s3_prefix:
+            return
+        try:
+            import boto3
+        except ImportError:
+            logger.warning("boto3 not installed; S3 prefix download skipped")
+            return
+        cfg = get_config()
+        s3 = boto3.client("s3", region_name=cfg.aws_region)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=cfg.s3_cache_bucket, Prefix=s3_prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key == s3_prefix or key.endswith("/"):
+                    continue
+                rel = key[len(s3_prefix):].lstrip("/")
+                if not rel:
+                    continue
+                local_file = local_dir / rel
+                local_file.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    s3.download_file(cfg.s3_cache_bucket, key, str(local_file))
+                except Exception as e:
+                    logger.warning(f"Failed S3 download for {key}: {e}")
+
     # ---------- Tardis ----------
     def tardis_dir(self, exchange: str, symbol: str, data_type: str, *, raw: bool = True) -> Path:
         base = get_tardis_cache_dir() / self._safe(exchange) / self._safe(symbol) / self._safe(data_type)

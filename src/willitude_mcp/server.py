@@ -38,6 +38,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger("willitude_mcp")
 
+
+def get_user_context(ctx: Context) -> dict:
+    """Extract identity from API Gateway injected headers (symmetric with other willitude MCPs).
+    For HTTP transport, uses ctx.request_context.request.headers (Starlette, case-insensitive).
+    For local (stdio), falls back to unknown.
+    """
+    if ctx is None or not hasattr(ctx, "request_context"):
+        return {"role": "unknown", "user_id": None, "team": None}
+    req_ctx = ctx.request_context
+    request = getattr(req_ctx, "request", None)
+    if request is not None:
+        headers = getattr(request, "headers", {}) or {}
+    else:
+        headers = getattr(req_ctx, "headers", {}) or {}
+    # Headers object or dict; get works case-insensitively for Starlette Headers
+    def get_h(k: str):
+        if hasattr(headers, "get"):
+            v = headers.get(k)
+            if v is None:
+                v = headers.get(k.lower())
+            return v
+        return headers.get(k) if isinstance(headers, dict) else None
+    return {
+        "user_id": get_h("x-user-id"),
+        "role": get_h("x-user-role") or "unknown",
+        "team": get_h("x-team"),
+    }
+
+
+def require_role(user: dict, allowed: set[str]):
+    role = user.get("role", "unknown")
+    if role not in allowed:
+        raise PermissionError(f"Role '{role}' not authorized for this operation. Allowed: {allowed}")
+
+
 mcp = FastMCP(
     name="WillitudeData",
     instructions=(
@@ -47,7 +82,12 @@ mcp = FastMCP(
         "2. Prefer the high-level materialize_*_to_project tools. "
         "3. After success, always extract 'project_paths' from the JSON result and give the user clean relative loading code. "
         "4. Surface the manifest for reproducibility. "
-        "Keys come only from SSM at runtime. See the quant_data_workflow prompt for full rules."
+        "Keys come only from SSM at runtime. See the quant_data_workflow prompt for full rules.\n\n"
+        "**Authentication (remote/SSE use)**: Same as willitude-knowledge and willitude-trace. "
+        "Protected by API Gateway + Cognito JWT + Lambda Authorizer. "
+        "Use Authorization: Bearer <JWT> (from the shared willitude Cognito pool, using role-specific user like agent-quant-researcher). "
+        "Authorizer injects X-User-Role etc. Tools may require specific roles (e.g. to materialize expensive data). "
+        "For local: use AWS_PROFILE for SSM + mock headers or direct."
     ),
 )
 
@@ -144,6 +184,9 @@ async def ensure_tardis_data(
     force: bool = False,
     ctx: Context | None = None,
 ) -> str:
+    user = get_user_context(ctx) if ctx is not None else {"role": "unknown"}
+    require_role(user, {"quant-researcher", "data-engineer", "admin"})
+
     if ctx:
         await ctx.info(
             f"Ensuring Tardis: {exchange} {symbols} {from_date}..{to_date} types={data_types or ['trades']}"
@@ -363,6 +406,9 @@ async def materialize_tardis_to_project(
     project_dir: str | None = None,
     ctx: Context | None = None,
 ) -> str:
+    user = get_user_context(ctx) if ctx is not None else {"role": "unknown"}
+    require_role(user, {"quant-researcher", "data-engineer", "admin"})
+
     if ctx:
         await ctx.info(f"Materializing Tardis {exchange} {symbols} into project (symlinks={use_symlinks})...")
 
@@ -515,6 +561,9 @@ async def materialize_tardis_bars_to_project(
     if ctx:
         await ctx.info(f"Materializing Tardis bars {exchange} {symbols} {freq} into project...")
 
+    user = get_user_context(ctx) if ctx is not None else {"role": "unknown"}
+    require_role(user, {"quant-researcher", "data-engineer", "admin"})
+
     proj = _resolve_project_dir(project_dir)
     if not proj:
         return json.dumps({"error": "No active project. Call register_project first."})
@@ -575,6 +624,9 @@ async def ensure_tardis_bars(
 ) -> str:
     if ctx:
         await ctx.info(f"Building Tardis bars {exchange} {symbols} {freq} {from_date}..{to_date} keep_raw={keep_raw}")
+
+    user = get_user_context(ctx) if ctx is not None else {"role": "unknown"}
+    require_role(user, {"quant-researcher", "data-engineer", "admin"})
 
     client = _get_tardis()
     result = await client.ensure_tardis_bars(
@@ -727,8 +779,14 @@ def run_server() -> None:
     except Exception as exc:
         logger.warning("Could not fetch one or both SSM keys at startup (will retry on first use): %s", exc)
 
-    # Default transport is stdio — perfect for Claude Desktop, Cursor, Windsurf, etc.
-    mcp.run()
+    transport = os.getenv("TRANSPORT", "stdio")
+    if transport == "streamable-http":
+        # For remote deploy behind API Gateway (auth at gateway).
+        # Path matches ALB route /data/mcp ; security settings disable DNS rebinding (as in willitude-knowledge/trace).
+        mcp.run(transport="streamable-http", path="/data/mcp")
+    else:
+        # Default transport is stdio — perfect for Claude Desktop, Cursor, Windsurf, etc.
+        mcp.run()
 
 
 if __name__ == "__main__":

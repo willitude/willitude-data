@@ -74,6 +74,29 @@ class DatabentoDataClient:
                 )
                 continue
 
+            # S3 read-through for daily databento shards
+            if self.cache.is_s3():
+                for day in missing[:]:  # copy
+                    s3_key = self.cache.s3_databento_key(dataset, symbol, schema, day)
+                    daily_path = self.cache.databento_daily_path(dataset, symbol, schema, day)
+                    self.cache.download_from_s3(s3_key, daily_path)
+                    if daily_path.exists():
+                        missing.remove(day)  # now have it
+
+            if not missing and not force:
+                logger.info("Databento cache hit (restored from S3): %s %s %s %s..%s", dataset, symbol, schema, start, end)
+                results.append(
+                    {
+                        "dataset": dataset,
+                        "symbol": symbol,
+                        "schema": schema,
+                        "status": "restored_from_s3",
+                        "missing_days": 0,
+                        "path": str(self.cache.databento_dir(dataset, symbol, schema)),
+                    }
+                )
+                continue
+
             if force:
                 missing = self.cache._date_range(start, end)
 
