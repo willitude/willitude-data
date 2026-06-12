@@ -6,6 +6,7 @@ Designed for quant researchers who want to ask an AI coding/research agent (Clau
 
 - Runs locally (your laptop) using AWS SSO
 - Can also run on AWS (EC2, ECS, SageMaker, etc.) using IAM roles — same code
+- Designed so that research (notebook) and live execution (canary) share the exact same processed data via S3. The canary does **not** do backtesting — it uses recent historical bars (e.g. last N days at 1m) for feature computation, model warm-up, state initialization, and consistency with research-validated data, while consuming live feeds for actual trading.
 - Never hard-codes or logs the API keys
 - Keys live only in SSM + short-lived in-process memory
 
@@ -181,7 +182,37 @@ You can safely delete subdirectories to free space. The server will re-download 
 | `AWS_REGION` / `WILLITUDE_AWS_REGION` | Region for SSM and S3 client             | `ap-northeast-1` (Tokyo recommended) |
 | `WILLITUDE_CONVERT_TARDIS_PARQUET` | `0` to disable auto parquet conversion | `1` (default)                        |
 
-When S3 is enabled, `ensure_*` will check S3 first (download to local working copy if present), fetch from provider only for missing, then upload to S3. Bars are always synced to S3. Manifest records S3 keys.
+When S3 is enabled (set `WILLITUDE_S3_CACHE_BUCKET=willitude-data-cache`), the server uses S3 as the primary global cache with read-through/write-through:
+
+- For `ensure_tardis_data` and `ensure_tardis_bars`: daily shards are checked in S3 first. If present, downloaded to local working copy. If missing, fetched from the provider (Tardis/Databento), saved locally, and uploaded to S3.
+- Bars (the recommended research format) are small and always kept in sync with S3.
+- `manifest.jsonl` records the S3 key for each entry so you can trace where data came from across machines.
+- Local `~/.willitude/willitude-data/` acts as a working copy / cache for the current machine.
+- Materialize still creates symlinks (or copies) from the local working copy into your project folder.
+
+This lets multiple research machines (laptops, research servers, etc.) share the same expensive-to-generate bars and raw shards without re-downloading from the providers every time.
+
+**Recommended bucket region for research**:
+- ap-northeast-2 (Seoul) if your primary access is from Korean laptops (lower latency for pulling large histories).
+- ap-northeast-1 (Tokyo) if you want to align with trading infrastructure / SSM (cross-region read is still fine for research data).
+
+SSM keys stay in their original region (usually Tokyo); S3 region is independent via `WILLITUDE_S3_REGION`.
+
+If the env var is not set, everything stays pure local (full backward compatibility).
+
+## Optional: Running as a shared remote service
+
+For team/research server use (similar pattern to other willitude MCPs), you can deploy this as a streamable-http server behind the existing willitude API Gateway + Cognito auth:
+
+- Run with `TRANSPORT=streamable-http` (the server supports `path="/data/mcp"`).
+- Add ALB routing for `/data/*` to the willitude-cluster in Seoul.
+- Use the same Cognito authorizer (roles like quant-researcher, data-engineer, admin).
+- Task role needs S3 read/write on the cache bucket + SSM read for the Tardis/Databento keys (in their region).
+- Resource recommendation: 1 vCPU / 4 GB+ memory (data processing can be heavy).
+
+See the deploy patterns in the willitude-knowledge/trace repos for CI (build with uv.lock + README in image, push :latest, force redeploy). The GitHub OIDC trust policy for the actions role will need the willitude-data repo added (infra team can handle).
+
+For local development you can still use stdio + AWS_PROFILE.
 
 ## Running on AWS
 

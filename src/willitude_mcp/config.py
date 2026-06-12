@@ -13,18 +13,18 @@ class WillitudeConfig(BaseModel):
 
     # Cache location. Can be set via WILLITUDE_CACHE_DIR env.
     # For S3-based (recommended for remote/authenticated use, consistent with other willitude MCPs):
-    # Set WILLITUDE_S3_CACHE_BUCKET (and optional WILLITUDE_S3_CACHE_PREFIX="willitude-data").
-    # Then the global cache lives in S3 (Seoul), and materialize downloads to project as needed.
+    # Set WILLITUDE_S3_CACHE_BUCKET (and optional WILLITUDE_S3_CACHE_PREFIX="willitude-data", WILLITUDE_S3_REGION).
+    # Then the global cache lives in S3, and materialize downloads to project as needed.
     cache_dir: Path = Field(
         default_factory=lambda: Path.home() / ".willitude" / "willitude-data",
         description="Root directory for all cached market data (Parquet/CSV etc). "
         "Default: ~/.willitude/willitude-data/ (contains tardis/, databento/, manifest.jsonl). "
-        "For S3: set WILLITUDE_S3_CACHE_BUCKET to use S3 Seoul as global cache (no local ~/.willitude needed in remote).",
+        "For S3: set WILLITUDE_S3_CACHE_BUCKET (bucket can be in Seoul ap-northeast-2 for low laptop latency, or Tokyo ap-northeast-1 for trading infra consistency).",
     )
 
     s3_cache_bucket: str | None = Field(
         default_factory=lambda: os.getenv("WILLITUDE_S3_CACHE_BUCKET"),
-        description="S3 bucket for global cache (Seoul). If set, cache is S3-based for consistency with willitude-knowledge/trace.",
+        description="S3 bucket for global cache. Recommended: 'willitude-data-cache' in ap-northeast-1 (Tokyo) or ap-northeast-2 (Seoul for laptop research latency). If set, enables S3 read-through/write-through for sharing between research machines.",
     )
     s3_cache_prefix: str = Field(
         default="willitude-data",
@@ -40,6 +40,15 @@ class WillitudeConfig(BaseModel):
     aws_region: str = Field(
         default="ap-northeast-1",
         description="AWS region for SSM (where the /willitude/* params live).",
+    )
+
+    # S3 region can be different from SSM region for flexibility (e.g. Seoul for low-latency research access from MacBook, Tokyo for infra consistency).
+    s3_region: str = Field(
+        default_factory=lambda: os.getenv("WILLITUDE_S3_REGION") or "ap-northeast-1",
+        description="AWS region for S3 client (can be different from SSM region). "
+        "Research data on MacBook: ap-northeast-2 (Seoul) recommended for low latency. "
+        "Trading/canary infra consistency: ap-northeast-1 (Tokyo). "
+        "SSM always uses aws_region (Tokyo in this setup).",
     )
 
     # SSM parameter names (override only if org changes them)
@@ -71,6 +80,7 @@ class WillitudeConfig(BaseModel):
 
         s3_bucket = os.getenv("WILLITUDE_S3_CACHE_BUCKET")
         s3_prefix = os.getenv("WILLITUDE_S3_CACHE_PREFIX", "willitude-data")
+        s3_region = os.getenv("WILLITUDE_S3_REGION") or aws_region or "ap-northeast-1"
 
         convert = os.getenv("WILLITUDE_CONVERT_TARDIS_PARQUET", "1").lower() not in {
             "0",
@@ -84,6 +94,7 @@ class WillitudeConfig(BaseModel):
             aws_region=aws_region or "ap-northeast-1",
             s3_cache_bucket=s3_bucket,
             s3_cache_prefix=s3_prefix,
+            s3_region=s3_region,
             convert_tardis_to_parquet=convert,
         )
 
