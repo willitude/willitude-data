@@ -96,6 +96,8 @@ This is the intended UX for a quant researcher who lives in their own research f
 
 This gives you deduplication + speed of a central cache, while every research repo feels self-contained and git-friendly.
 
+**Smart caching for rolling campaigns**: Both providers now use date-partitioned storage + missing-day calculation. Repeatedly calling `materialize_*_to_project(..., from_date=..., to_date="today")` only downloads the new days. Overlapping requests share daily shards. No more full re-downloads for ongoing work.
+
 ## For AI Agents (Cursor, Claude Desktop, Windsurf, Cline, etc.)
 
 This server is specifically designed to be **agent-friendly**.

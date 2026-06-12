@@ -25,9 +25,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -74,9 +75,14 @@ class CacheManager:
         return d
 
     def databento_parquet_path(self, dataset: str, symbol: str, schema: str, start: str, end: str) -> Path:
+        """Legacy range-based path (kept for backward compat in listing)."""
         safe_start = start.replace(":", "").replace("T", "_")[:16]
         safe_end = end.replace(":", "").replace("T", "_")[:16]
         return self.databento_dir(dataset, symbol, schema) / f"{safe_start}_{safe_end}.parquet"
+
+    def databento_daily_path(self, dataset: str, symbol: str, schema: str, day: str) -> Path:
+        """Preferred: one clean Parquet per day."""
+        return self.databento_dir(dataset, symbol, schema) / f"{day}.parquet"
 
     # ---------- General ----------
     def _safe(self, s: str) -> str:
@@ -177,6 +183,91 @@ class CacheManager:
         if limit:
             df = df.head(limit)
         return df
+
+    # ---------------------- Smart date-aware caching helpers (for rolling campaigns) ----------------------
+
+    DATE_RE = re.compile(r'(\d{4}-\d{2}-\d{2})')
+
+    def _extract_dates(self, directory: Path) -> set[str]:
+        """Scan a directory recursively for YYYY-MM-DD patterns in filenames."""
+        dates: set[str] = set()
+        if not directory.exists():
+            return dates
+        for f in directory.rglob("*"):
+            if f.is_file():
+                m = self.DATE_RE.search(f.name)
+                if m:
+                    dates.add(m.group(1))
+        return dates
+
+    def get_tardis_available_dates(self, exchange: str, symbol: str, data_type: str) -> set[str]:
+        """Return set of 'YYYY-MM-DD' strings that have data for this Tardis symbol/type."""
+        raw_dir = self.tardis_dir(exchange, symbol, data_type, raw=True)
+        return self._extract_dates(raw_dir)
+
+    def get_databento_available_dates(self, dataset: str, symbol: str, schema: str) -> set[str]:
+        """Return set of 'YYYY-MM-DD' for which we have daily Parquet files."""
+        # We will migrate to daily files; for backward compat also check old range files
+        d = self.databento_dir(dataset, symbol, schema)
+        dates: set[str] = set()
+        if not d.exists():
+            return dates
+        for f in d.glob("*.parquet"):
+            # New style: 2024-06-01.parquet
+            m = self.DATE_RE.search(f.stem)
+            if m:
+                dates.add(m.group(1))
+            else:
+                # Old range style like 20240601_20240603 -> expand (approximate)
+                parts = f.stem.split("_")
+                if len(parts) >= 2:
+                    try:
+                        s = datetime.strptime(parts[0][:8], "%Y%m%d").date()
+                        e = datetime.strptime(parts[1][:8], "%Y%m%d").date()
+                        cur = s
+                        while cur <= e:
+                            dates.add(cur.isoformat())
+                            cur += timedelta(days=1)
+                    except Exception:
+                        pass
+        return dates
+
+    def _date_range(self, from_date: str, to_date: str) -> list[str]:
+        """Return inclusive list of 'YYYY-MM-DD' between two dates (inclusive)."""
+        start = date.fromisoformat(from_date)
+        end = date.fromisoformat(to_date)
+        if start > end:
+            return []
+        days = []
+        cur = start
+        while cur <= end:
+            days.append(cur.isoformat())
+            cur += timedelta(days=1)
+        return days
+
+    def compute_missing_dates(self, from_date: str, to_date: str, available: set[str]) -> list[str]:
+        """Return list of dates in the requested range that are not in available."""
+        requested = self._date_range(from_date, to_date)
+        return [d for d in requested if d not in available]
+
+    def group_into_ranges(self, dates: list[str]) -> list[tuple[str, str]]:
+        """Group a sorted list of dates into minimal contiguous [start, end] ranges."""
+        if not dates:
+            return []
+        dates = sorted(dates)
+        ranges = []
+        start = dates[0]
+        prev = date.fromisoformat(dates[0])
+        for d_str in dates[1:]:
+            d = date.fromisoformat(d_str)
+            if (d - prev).days == 1:
+                prev = d
+            else:
+                ranges.append((start, prev.isoformat()))
+                start = d_str
+                prev = d
+        ranges.append((start, prev.isoformat()))
+        return ranges
 
     # ---------------------- Project Materialize (UX for quant work folders) ----------------------
 

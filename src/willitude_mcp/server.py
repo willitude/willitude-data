@@ -339,13 +339,10 @@ def register_project(project_root: str, name: str | None = None) -> str:
     name="materialize_tardis_to_project",
     description=(
         "PRIMARY RECOMMENDED TOOL for bringing Tardis data into the user's research project. "
-        "It does TWO things in one call: (1) ensures the requested data exists in the global deduplicated cache using SSM keys, "
-        "(2) creates symlinks (use_symlinks=true by default) or real copies under the registered project directory (data/raw/tardis/...). "
-        "Also appends a detailed entry to data/raw/_willitude_manifest.json (original query, timestamps, source paths). "
-        "RULE: Prefer this over ensure_tardis_data whenever the user is working in a project folder. "
-        "After success, parse the 'project_paths' array from the JSON result — these are relative paths you should put into the user's code (pl.scan_parquet etc.). "
-        "Parameters like exchange, symbols, from_date etc. are the same as ensure_tardis_data. "
-        "Use small date ranges first for testing. Returns structured result with ensure_summary + materialized + manifest path + usage_hint."
+        "SMART INCREMENTAL: only missing days are downloaded (daily-aware cache). "
+        "Does (1) smart ensure in global cache (2) symlinks/copies under project/data/raw/tardis/... + manifest. "
+        "RULE: Use this for any rolling/ongoing campaign. After success use the 'project_paths' for relative loads. "
+        "Same params as ensure_tardis_data."
     ),
 )
 async def materialize_tardis_to_project(
@@ -422,12 +419,9 @@ async def materialize_tardis_to_project(
     name="materialize_databento_to_project",
     description=(
         "PRIMARY RECOMMENDED TOOL for Databento data. "
-        "Combines ensure + materialize: populates global cache if needed, then creates symlinks (default) or copies inside the registered project under data/raw/databento/..., "
-        "plus writes provenance to _willitude_manifest.json. "
-        "RULE: Use this (not ensure_databento_data) when the user has a project folder. "
-        "After calling, take the 'project_paths' from the result (they are relative to the project) and insert clean loading code for the user. "
-        "Same selection parameters as ensure_databento_data (dataset, symbols, schema, start, end...). "
-        "Returns JSON with materialized info + manifest location + usage_hint."
+        "SMART INCREMENTAL: stores daily Parquets, only fetches missing days for rolling windows. "
+        "Combines smart ensure + materialize (symlinks under data/raw/databento/ + manifest). "
+        "After success, use 'project_paths' (relative) for loading code. Prefer over raw ensure_*."
     ),
 )
 async def materialize_databento_to_project(
@@ -571,9 +565,10 @@ You are using the WillitudeData MCP server (Tardis crypto + Databento traditiona
    - Use use_symlinks=true (the default) unless the user wants a self-contained copy (use_symlinks=false).
    - Report disk impact or ask before very large requests.
 
-5. **Reproducibility**
-   - The _willitude_manifest.json written in the project's data/raw/ is the source of truth for "what data was used for this experiment".
-   - After materializing important datasets, call list_data_in_project() or read the manifest to confirm.
+5. **Reproducibility & Rolling Campaigns**
+   - The cache is now date-partitioned and smart: repeated calls for rolling windows (e.g. "last 90 days" every day) only download the new days.
+   - _willitude_manifest.json + list_data_in_project() give full provenance.
+   - Always use materialize_*_to_project for campaigns so the project has clean daily references.
 
 === RECOMMENDED STEP-BY-STEP FLOW ===
 

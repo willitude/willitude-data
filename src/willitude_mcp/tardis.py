@@ -67,11 +67,13 @@ class TardisDataClient:
                 raw_dir = self.cache.tardis_dir(exchange, symbol, dtype, raw=True)
                 unified = self.cache.tardis_unified_parquet(exchange, symbol, dtype)
 
-                # Simple existence heuristic: if any .csv or .gz file exists for the symbol/type and not force
-                existing_files = list(raw_dir.glob("*.csv*")) + list(raw_dir.glob("*.gz"))
-                if existing_files and not force:
+                available = self.cache.get_tardis_available_dates(exchange, symbol, dtype)
+                missing = self.cache.compute_missing_dates(from_date, to_date, available)
+
+                if not missing and not force:
                     logger.info(
-                        "Tardis cache hit: %s %s %s (%d files)", exchange, symbol, dtype, len(existing_files)
+                        "Tardis smart cache hit: %s %s %s — all %s..%s days present",
+                        exchange, symbol, dtype, from_date, to_date
                     )
                     results.append(
                         {
@@ -80,45 +82,46 @@ class TardisDataClient:
                             "data_type": dtype,
                             "status": "cached",
                             "raw_dir": str(raw_dir),
-                            "files": len(existing_files),
+                            "files": len(list(raw_dir.glob("*.csv*")) + list(raw_dir.glob("*.gz"))),
                             "unified_parquet": str(unified) if unified.exists() else None,
+                            "missing_days": 0,
                         }
                     )
                     continue
 
-                # Perform download
+                # Compute minimal contiguous missing blocks to avoid re-downloading known days
+                ranges = self.cache.group_into_ranges(missing) if missing else [(from_date, to_date)]
+
                 logger.info(
-                    "Downloading Tardis %s %s %s %s -> %s",
-                    exchange,
-                    symbol,
-                    dtype,
-                    f"{from_date}..{to_date}",
-                    raw_dir,
+                    "Tardis smart fetch: %s %s %s %s..%s — %d missing days in %d block(s)",
+                    exchange, symbol, dtype, from_date, to_date, len(missing), len(ranges)
                 )
-                try:
-                    self.download_datasets(
-                        exchange=exchange,
-                        data_types=[dtype],
-                        symbols=[symbol],
-                        from_date=from_date,
-                        to_date=to_date,
-                        api_key=key,
-                        download_dir=str(raw_dir.parent),  # tardis-dev creates its layout under this
-                        # We pass parent of "raw"; it often works; fallback below uses the leaf dir.
-                    )
-                except Exception as exc:
-                    # The library sometimes expects the dir to be the final leaf.
-                    # Retry with the raw dir itself as download_dir.
-                    logger.warning("First download attempt layout may have been off, retrying with leaf dir: %s", exc)
-                    self.download_datasets(
-                        exchange=exchange,
-                        data_types=[dtype],
-                        symbols=[symbol],
-                        from_date=from_date,
-                        to_date=to_date,
-                        api_key=key,
-                        download_dir=str(raw_dir),
-                    )
+
+                for rstart, rend in ranges:
+                    try:
+                        self.download_datasets(
+                            exchange=exchange,
+                            data_types=[dtype],
+                            symbols=[symbol],
+                            from_date=rstart,
+                            to_date=rend,
+                            api_key=key,
+                            download_dir=str(raw_dir.parent),
+                        )
+                    except Exception as exc:
+                        logger.warning("Tardis sub-range download issue for %s..%s: %s", rstart, rend, exc)
+                        try:
+                            self.download_datasets(
+                                exchange=exchange,
+                                data_types=[dtype],
+                                symbols=[symbol],
+                                from_date=rstart,
+                                to_date=rend,
+                                api_key=key,
+                                download_dir=str(raw_dir),
+                            )
+                        except Exception as exc2:
+                            logger.error("Tardis fallback also failed: %s", exc2)
 
                 # Post-process: count + optional convert to single parquet for convenience
                 files_after = list(raw_dir.glob("**/*")) if raw_dir.exists() else []
@@ -158,6 +161,7 @@ class TardisDataClient:
                         "files": len(csv_files),
                         "size_bytes": size,
                         "unified_parquet": str(parquet_path) if parquet_path else None,
+                        "missing_days": len(missing) if "missing" in locals() else len(self.cache.compute_missing_dates(from_date, to_date, set())),
                     }
                 )
 

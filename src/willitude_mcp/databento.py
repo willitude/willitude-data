@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import pandas as pd  # only for date splitting in smart fetch
 import polars as pl
 
 from .cache import CacheEntry, CacheManager
@@ -44,12 +45,11 @@ class DatabentoDataClient:
         force: bool = False,
     ) -> dict[str, Any]:
         """
-        Fetch Databento timeseries data and cache it as Parquet.
+        Smart incremental fetch + daily partitioned storage.
 
-        Common datasets: "GLBX.MDP3" (CME), "XNAS.ITCH", "OPRA.PITCH", etc.
-        Schemas: "trades", "mbo", "mbp-1", "mbp-10", "ohlcv-1s", "ohlcv-1m", "trades", ...
-        symbols: e.g. ["ES.FUT", "NQ.FUT"] or specific contract like "ESH4"
-        start/end: ISO like "2024-01-01T00:00:00" or "2024-01-01"
+        We store one clean {YYYY-MM-DD}.parquet per day.
+        Only missing days (or forced) are downloaded.
+        Overlapping or rolling requests (e.g. "last 30 days" repeatedly) become cheap.
         """
         key = get_databento_key()
         client = self.db.Historical(key=key)
@@ -57,98 +57,119 @@ class DatabentoDataClient:
         results = []
 
         for symbol in symbols:
-            target = self.cache.databento_parquet_path(dataset, symbol, schema, start, end)
+            available = self.cache.get_databento_available_dates(dataset, symbol, schema)
+            missing = self.cache.compute_missing_dates(start, end, available)
 
-            if target.exists() and not force:
-                size = target.stat().st_size
-                logger.info("Databento cache hit: %s %s %s -> %s", dataset, symbol, schema, target)
+            if not missing and not force:
+                logger.info("Databento cache hit (all days present): %s %s %s %s..%s", dataset, symbol, schema, start, end)
                 results.append(
                     {
                         "dataset": dataset,
                         "symbol": symbol,
                         "schema": schema,
                         "status": "cached",
-                        "path": str(target),
-                        "size_bytes": size,
+                        "missing_days": 0,
+                        "path": str(self.cache.databento_dir(dataset, symbol, schema)),
                     }
                 )
                 continue
 
+            if force:
+                missing = self.cache._date_range(start, end)
+
             logger.info(
-                "Requesting Databento %s %s %s %s..%s",
-                dataset,
-                symbol,
-                schema,
-                start,
-                end,
+                "Databento smart fetch: %s %s %s %s..%s — %d missing days",
+                dataset, symbol, schema, start, end, len(missing)
             )
 
-            try:
-                # get_range returns a DBNStore
-                dbn = client.timeseries.get_range(
-                    dataset=dataset,
-                    symbols=[symbol],
-                    schema=schema,
-                    start=start,
-                    end=end,
-                    stype_in=stype_in or "raw_symbol",  # common default
-                )
+            # Group missing days into minimal contiguous ranges for efficient SDK calls
+            ranges = self.cache.group_into_ranges(missing)
 
-                # Materialize to Parquet (zstd for good compression + speed)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                # Preferred: convert via polars or use built-in
+            downloaded_paths = []
+            total_size = 0
+
+            for rstart, rend in ranges:
                 try:
-                    # DBNStore has to_parquet in recent versions
-                    if hasattr(dbn, "to_parquet"):
-                        dbn.to_parquet(str(target))  # type: ignore[attr-defined]
-                    else:
-                        # Fallback: to_df then polars
+                    dbn = client.timeseries.get_range(
+                        dataset=dataset,
+                        symbols=[symbol],
+                        schema=schema,
+                        start=rstart,
+                        end=rend,
+                        stype_in=stype_in or "raw_symbol",
+                    )
+
+                    # Write daily files (even if the SDK gave us a block)
+                    # Simplest robust way: convert to df and split by date
+                    try:
                         df = dbn.to_df()
-                        pl.from_pandas(df).write_parquet(target, compression="zstd")
-                except Exception:
-                    # Another fallback path
-                    df = dbn.to_df()
-                    pl.from_pandas(df).write_parquet(target, compression="zstd")
+                        if df.empty:
+                            continue
+                        # Expect a timestamp column; Databento usually has 'ts_event' or similar
+                        ts_col = None
+                        for c in ("ts_event", "timestamp", "time", "ts"):
+                            if c in df.columns:
+                                ts_col = c
+                                break
+                        if ts_col:
+                            df["_day"] = pd.to_datetime(df[ts_col]).dt.date
+                            for day, day_df in df.groupby("_day"):
+                                day_str = str(day)
+                                daily_path = self.cache.databento_daily_path(dataset, symbol, schema, day_str)
+                                daily_path.parent.mkdir(parents=True, exist_ok=True)
+                                pl.from_pandas(day_df.drop(columns=["_day"], errors="ignore")).write_parquet(daily_path, compression="zstd")
+                                downloaded_paths.append(str(daily_path))
+                                if daily_path.exists():
+                                    total_size += daily_path.stat().st_size
+                        else:
+                            # Fallback: write whole block as one daily-ish file (rare)
+                            daily_path = self.cache.databento_daily_path(dataset, symbol, schema, rstart)
+                            daily_path.parent.mkdir(parents=True, exist_ok=True)
+                            pl.from_pandas(df).write_parquet(daily_path, compression="zstd")
+                            downloaded_paths.append(str(daily_path))
+                    except Exception:
+                        # If to_df fails or no pandas, fall back to writing the whole block to the first day's name
+                        daily_path = self.cache.databento_daily_path(dataset, symbol, schema, rstart)
+                        daily_path.parent.mkdir(parents=True, exist_ok=True)
+                        if hasattr(dbn, "to_parquet"):
+                            dbn.to_parquet(str(daily_path))
+                        else:
+                            df = dbn.to_df()
+                            pl.from_pandas(df).write_parquet(daily_path, compression="zstd")
+                        downloaded_paths.append(str(daily_path))
 
-                size = target.stat().st_size
-                entry = CacheEntry(
-                    provider="databento",
-                    path=str(target),
-                    size_bytes=size,
-                    created_at=__import__("datetime").datetime.now(
-                        __import__("datetime").timezone.utc
-                    ).isoformat(),
-                    meta={
-                        "dataset": dataset,
-                        "symbol": symbol,
-                        "schema": schema,
-                        "start": start,
-                        "end": end,
-                    },
-                )
-                self.cache.record_download(entry)
+                except Exception as exc:
+                    logger.exception("Databento block fetch failed for %s %s %s %s..%s", dataset, symbol, schema, rstart, rend)
+                    # continue with other blocks
 
-                results.append(
-                    {
-                        "dataset": dataset,
-                        "symbol": symbol,
-                        "schema": schema,
-                        "status": "downloaded",
-                        "path": str(target),
-                        "size_bytes": size,
-                    }
-                )
-            except Exception as exc:
-                logger.exception("Databento fetch failed for %s %s %s", dataset, symbol, schema)
-                results.append(
-                    {
-                        "dataset": dataset,
-                        "symbol": symbol,
-                        "schema": schema,
-                        "status": "error",
-                        "error": str(exc),
-                    }
-                )
+            entry = CacheEntry(
+                provider="databento",
+                path=str(self.cache.databento_dir(dataset, symbol, schema)),
+                size_bytes=total_size,
+                created_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+                meta={
+                    "dataset": dataset,
+                    "symbol": symbol,
+                    "schema": schema,
+                    "requested_start": start,
+                    "requested_end": end,
+                    "fetched_ranges": ranges,
+                },
+            )
+            self.cache.record_download(entry)
+
+            results.append(
+                {
+                    "dataset": dataset,
+                    "symbol": symbol,
+                    "schema": schema,
+                    "status": "downloaded",
+                    "missing_days": len(missing),
+                    "fetched_ranges": ranges,
+                    "daily_files": len(downloaded_paths),
+                    "path": str(self.cache.databento_dir(dataset, symbol, schema)),
+                }
+            )
 
         return {
             "provider": "databento",
