@@ -244,7 +244,7 @@ class TardisDataClient:
         return {"exchange": exchange, "symbol": symbol, "data_types": dtypes}
 
     # ---------- Bars (aggregated time series) ----------
-    def ensure_tardis_bars(
+    async def ensure_tardis_bars(
         self,
         exchange: str,
         symbols: list[str],
