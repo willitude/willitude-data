@@ -150,7 +150,7 @@ async def ensure_tardis_data(
         )
 
     client = _get_tardis()
-    result = client.ensure_cached(
+    result = await client.ensure_cached(
         exchange=exchange,
         symbols=symbols,
         from_date=from_date,
@@ -577,7 +577,7 @@ async def ensure_tardis_bars(
         await ctx.info(f"Building Tardis bars {exchange} {symbols} {freq} {from_date}..{to_date} keep_raw={keep_raw}")
 
     client = _get_tardis()
-    result = client.ensure_tardis_bars(
+    result = await client.ensure_tardis_bars(
         exchange=exchange,
         symbols=symbols,
         from_date=from_date,

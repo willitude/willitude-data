@@ -7,9 +7,11 @@ Tardis data is exchange-native tick data (trades, incremental_book_L2 / L3, quot
 from __future__ import annotations
 
 import logging
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
+import anyio
 import polars as pl
 
 from .cache import CacheEntry, CacheManager
@@ -35,7 +37,7 @@ class TardisDataClient:
         self.download_datasets = _import_tardis()
         self.cfg = get_config()
 
-    def ensure_cached(
+    async def ensure_cached(
         self,
         exchange: str,
         symbols: list[str],
@@ -100,31 +102,39 @@ class TardisDataClient:
                 )
 
                 for rstart, rend in ranges:
+                    # tardis-dev treats to_date as exclusive, while our API is inclusive.
+                    # Add one day when calling the library.
+                    effective_to = (date.fromisoformat(rend) + timedelta(days=1)).isoformat()
+
                     try:
-                        self.download_datasets(
-                            exchange=exchange,
-                            data_types=[dtype],
-                            symbols=[symbol],
-                            from_date=rstart,
-                            to_date=rend,
-                            api_key=key,
-                            download_dir=str(raw_dir.parent),
-                            timeout=300,
-                            concurrency=12,
+                        await anyio.to_thread.run_sync(
+                            lambda rs=rstart, re=effective_to: self.download_datasets(
+                                exchange=exchange,
+                                data_types=[dtype],
+                                symbols=[symbol],
+                                from_date=rs,
+                                to_date=re,
+                                api_key=key,
+                                download_dir=str(raw_dir.parent),
+                                timeout=300,
+                                concurrency=12,
+                            )
                         )
                     except Exception as exc:
                         logger.warning("Tardis sub-range download issue for %s..%s: %s", rstart, rend, exc)
                         try:
-                            self.download_datasets(
-                                exchange=exchange,
-                                data_types=[dtype],
-                                symbols=[symbol],
-                                from_date=rstart,
-                                to_date=rend,
-                                api_key=key,
-                                download_dir=str(raw_dir),
-                                timeout=300,
-                                concurrency=12,
+                            await anyio.to_thread.run_sync(
+                                lambda rs=rstart, re=effective_to: self.download_datasets(
+                                    exchange=exchange,
+                                    data_types=[dtype],
+                                    symbols=[symbol],
+                                    from_date=rs,
+                                    to_date=re,
+                                    api_key=key,
+                                    download_dir=str(raw_dir),
+                                    timeout=300,
+                                    concurrency=12,
+                                )
                             )
                         except Exception as exc2:
                             logger.error("Tardis fallback also failed: %s", exc2)
@@ -157,17 +167,27 @@ class TardisDataClient:
                     if parquet_path:
                         logger.info("Converted to unified parquet: %s", parquet_path)
 
+                post_available = self.cache.get_tardis_available_dates(exchange, symbol, dtype)
+                still_missing = self.cache.compute_missing_dates(from_date, to_date, post_available)
+
+                status = "downloaded"
+                err = None
+                if still_missing and len(missing) > 0:
+                    status = "error"
+                    err = f"Download completed but {len(still_missing)} requested days are still missing. Last attempted ranges: {ranges}"
+
                 results.append(
                     {
                         "exchange": exchange,
                         "symbol": symbol,
                         "data_type": dtype,
-                        "status": "downloaded",
+                        "status": status,
                         "raw_dir": str(raw_dir),
                         "files": len(csv_files),
                         "size_bytes": size,
                         "unified_parquet": str(parquet_path) if parquet_path else None,
-                        "missing_days": len(missing) if "missing" in locals() else len(self.cache.compute_missing_dates(from_date, to_date, set())),
+                        "missing_days": len(still_missing),
+                        "error": err,
                     }
                 )
 
@@ -251,7 +271,7 @@ class TardisDataClient:
             data_types = ["trades", "derivative_ticker", "liquidations"]
 
         # 1. Ensure the raw inputs (smart incremental)
-        raw_result = self.ensure_cached(
+        raw_result = await self.ensure_cached(
             exchange=exchange,
             symbols=symbols,
             from_date=from_date,
@@ -297,6 +317,15 @@ class TardisDataClient:
                                 "day": day,
                                 "status": "built",
                                 "rows": len(bar_df),
+                            })
+                        else:
+                            results.append({
+                                "exchange": exchange,
+                                "symbol": symbol,
+                                "freq": freq,
+                                "day": day,
+                                "status": "error",
+                                "error": "No bar rows produced (possible download failure or no trades that day)",
                             })
                     except Exception as exc:
                         logger.exception("Failed to build bar for %s %s %s %s", exchange, symbol, freq, day)
