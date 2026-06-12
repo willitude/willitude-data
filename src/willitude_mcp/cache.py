@@ -90,7 +90,7 @@ class CacheManager:
             logger.warning("boto3 not installed; S3 upload skipped")
             return
         cfg = get_config()
-        s3 = boto3.client("s3", region_name=cfg.aws_region)
+        s3 = boto3.client("s3", region_name=cfg.s3_region)
         if local_path.is_file():
             s3.upload_file(str(local_path), cfg.s3_cache_bucket, s3_key)
         else:
@@ -109,7 +109,7 @@ class CacheManager:
             logger.warning("boto3 not installed; S3 download skipped")
             return
         cfg = get_config()
-        s3 = boto3.client("s3", region_name=cfg.aws_region)
+        s3 = boto3.client("s3", region_name=cfg.s3_region)
         local_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             s3.download_file(cfg.s3_cache_bucket, s3_key, str(local_path))
@@ -127,7 +127,7 @@ class CacheManager:
             logger.warning("boto3 not installed; S3 prefix download skipped")
             return
         cfg = get_config()
-        s3 = boto3.client("s3", region_name=cfg.aws_region)
+        s3 = boto3.client("s3", region_name=cfg.s3_region)
         local_dir.mkdir(parents=True, exist_ok=True)
         paginator = s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=cfg.s3_cache_bucket, Prefix=s3_prefix):

@@ -69,6 +69,8 @@ def get_user_context(ctx: Context) -> dict:
 
 def require_role(user: dict, allowed: set[str]):
     role = user.get("role", "unknown")
+    if role == "unknown":
+        return  # stdio local mode or unauthenticated local use: bypass role check
     if role not in allowed:
         raise PermissionError(f"Role '{role}' not authorized for this operation. Allowed: {allowed}")
 
@@ -222,6 +224,9 @@ async def ensure_databento_data(
     force: bool = False,
     ctx: Context | None = None,
 ) -> str:
+    user = get_user_context(ctx) if ctx is not None else {"role": "unknown"}
+    require_role(user, {"quant-researcher", "data-engineer", "admin"})
+
     if ctx:
         await ctx.info(f"Ensuring Databento: {dataset} {symbols} schema={schema} {start}..{end}")
 
@@ -420,7 +425,7 @@ async def materialize_tardis_to_project(
         })
 
     client = _get_tardis()
-    ensure_result = client.ensure_cached(
+    ensure_result = await client.ensure_cached(
         exchange=exchange,
         symbols=symbols,
         from_date=from_date,
@@ -489,6 +494,9 @@ async def materialize_databento_to_project(
     project_dir: str | None = None,
     ctx: Context | None = None,
 ) -> str:
+    user = get_user_context(ctx) if ctx is not None else {"role": "unknown"}
+    require_role(user, {"quant-researcher", "data-engineer", "admin"})
+
     if ctx:
         await ctx.info(f"Materializing Databento {dataset} {symbols} {schema} into project...")
 

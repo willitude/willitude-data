@@ -91,6 +91,9 @@ class TardisDataClient:
                             "missing_days": 0,
                         }
                     )
+                    if self.cache.is_s3():
+                        s3_prefix = self.cache.s3_tardis_key(exchange, symbol, dtype, raw=True)
+                        self.cache.upload_to_s3(raw_dir, s3_prefix)
                     continue
 
                 # S3 read-through: if S3 enabled, first try to pull existing shards for this symbol/type
@@ -338,6 +341,11 @@ class TardisDataClient:
             available = self.cache.get_tardis_bar_available_dates(exchange, symbol, freq)
             missing = self.cache.compute_missing_dates(from_date, to_date, available)
             if not missing and not force:
+                if self.cache.is_s3():
+                    for day in self.cache._date_range(from_date, to_date):
+                        bar_path = self.cache.tardis_bar_path(exchange, symbol, freq, day)
+                        if bar_path.exists():
+                            self.cache.upload_to_s3(bar_path, self.cache.s3_tardis_bar_key(exchange, symbol, freq, day))
                 if not keep_raw:
                     for day in self.cache._date_range(from_date, to_date):
                         self._cleanup_raw_for_day(exchange, symbol, data_types, day)

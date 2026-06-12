@@ -62,6 +62,12 @@ class DatabentoDataClient:
 
             if not missing and not force:
                 logger.info("Databento cache hit (all days present): %s %s %s %s..%s", dataset, symbol, schema, start, end)
+                if self.cache.is_s3():
+                    # one-time backfill to S3 for existing local cache
+                    for day in self.cache._date_range(start, end):
+                        daily_path = self.cache.databento_daily_path(dataset, symbol, schema, day)
+                        if daily_path.exists():
+                            self.cache.upload_to_s3(daily_path, self.cache.s3_databento_key(dataset, symbol, schema, day))
                 results.append(
                     {
                         "dataset": dataset,
@@ -85,6 +91,12 @@ class DatabentoDataClient:
 
             if not missing and not force:
                 logger.info("Databento cache hit (restored from S3): %s %s %s %s..%s", dataset, symbol, schema, start, end)
+                if self.cache.is_s3():
+                    # backfill any local days that S3 didn't have? but since restored, upload the days we just pulled
+                    for day in self.cache._date_range(start, end):
+                        daily_path = self.cache.databento_daily_path(dataset, symbol, schema, day)
+                        if daily_path.exists():
+                            self.cache.upload_to_s3(daily_path, self.cache.s3_databento_key(dataset, symbol, schema, day))
                 results.append(
                     {
                         "dataset": dataset,
@@ -164,6 +176,11 @@ class DatabentoDataClient:
                 except Exception as exc:
                     logger.exception("Databento block fetch failed for %s %s %s %s..%s", dataset, symbol, schema, rstart, rend)
                     # continue with other blocks
+
+            if self.cache.is_s3():
+                dir_path = self.cache.databento_dir(dataset, symbol, schema)
+                s3_prefix = self.cache.s3_databento_key(dataset, symbol, schema)
+                self.cache.upload_to_s3(dir_path, s3_prefix)
 
             entry = CacheEntry(
                 provider="databento",
