@@ -1,0 +1,31 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local data cache (user's real cache lives in ~/.willitude/cache by default)
+cache/
+*.parquet
+*.dbn
+*.csv.gz
+
+# Secrets / local env
+.env
+.env.*
+*.pem
+*.key
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# uv / lock (keep uv.lock in git for reproducible installs)
+# uv.lock  (usually committed)

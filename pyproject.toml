@@ -1,0 +1,49 @@
+[project]
+name = "willitude-mcp"
+version = "0.1.0"
+description = "Willitude Data MCP Server: Secure cached access to Tardis.dev (crypto) and Databento (equities/futures) market data for quant researchers. Credentials from AWS SSM Parameter Store. Runs locally or on AWS."
+readme = "README.md"
+authors = [
+    { name = "Yongseok Kim", email = "willitude@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.1.0",
+    "boto3>=1.35",
+    "tardis-dev>=0.1",
+    "databento>=0.50",
+    "polars>=1.0",
+    "pyarrow>=16",
+    "pydantic>=2.7",
+]
+
+[project.scripts]
+willitude-mcp = "willitude_mcp.server:run_server"
+
+[project.urls]
+Homepage = "https://github.com/willitude/willitude-data"
+Repository = "https://github.com/willitude/willitude-data"
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.5",
+    "pytest>=8.0",
+    "mypy>=1.10",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+disallow_untyped_defs = true
