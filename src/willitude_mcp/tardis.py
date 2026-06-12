@@ -115,7 +115,7 @@ class TardisDataClient:
                                 from_date=rs,
                                 to_date=re,
                                 api_key=key,
-                                download_dir=str(raw_dir.parent),
+                                download_dir=str(raw_dir),
                                 timeout=300,
                                 concurrency=12,
                             )
