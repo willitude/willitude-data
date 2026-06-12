@@ -559,6 +559,7 @@ async def materialize_tardis_bars_to_project(
         "This solves the disk problem: raw is tens of GB, 1m bars for same coverage is hundreds of MB. "
         "keep_raw=False (default) deletes the raw after bar creation. "
         "Supports the same smart missing-day resume as raw. "
+        "NOTE: Minutes with zero trades have no row (group_by). Consumer should reindex to full freq grid if needed for continuous time series. "
         "Example: ensure_tardis_bars(exchange='binance-futures', symbols=['BTCUSDT'], from_date='2024-01-01', to_date='2025-06-12', freq='1m')"
     ),
 )

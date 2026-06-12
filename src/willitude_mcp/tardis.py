@@ -323,7 +323,13 @@ class TardisDataClient:
         }
 
     def _build_bar_for_day(self, exchange: str, symbol: str, day: str, freq: str) -> pl.DataFrame | None:
-        """Build one day's bar dataframe from the three raw sources."""
+        """Build one day's bar dataframe from the three raw sources.
+        Matches verified logic from willitude/scripts/build_panel.py process_symbol_day:
+        - Proper us epoch parsing (done in _load)
+        - Ticker fields keep nulls (consumer can ffill)
+        - Liquidation notional = price * amount, split by side
+        - Include predicted_funding_rate
+        """
         # Load raw
         trades_dir = self.cache.tardis_dir(exchange, symbol, "trades", raw=True)
         ticker_dir = self.cache.tardis_dir(exchange, symbol, "derivative_ticker", raw=True)
@@ -340,7 +346,7 @@ class TardisDataClient:
         trades = trades.with_columns(
             pl.col("timestamp").dt.truncate(freq).alias("bar_time"),
             (pl.col("price") * pl.col("amount")).alias("notional"),
-            (pl.col("side") == "buy").cast(pl.Int64).alias("is_buy"),
+            (pl.col("side") == "buy").alias("is_buy"),   # keep as boolean
         )
 
         bars = (
@@ -358,37 +364,47 @@ class TardisDataClient:
             .sort("bar_time")
         )
 
-        # Join derivative_ticker (funding, oi, etc.) - forward fill within day
+        # Join derivative_ticker - last value per bar, keep nulls for missing ticks
         if ticker is not None and len(ticker) > 0:
             ticker = ticker.with_columns(pl.col("timestamp").dt.truncate(freq).alias("bar_time"))
-            # Keep useful columns if present
-            keep_cols = [c for c in ticker.columns if c in ("funding_rate", "open_interest", "index_price", "mark_price")]
+            keep_cols = [c for c in ticker.columns if c in (
+                "funding_rate", "predicted_funding_rate", "open_interest",
+                "index_price", "mark_price"
+            )]
             if keep_cols:
                 ticker_agg = ticker.group_by("bar_time").agg([pl.col(c).last() for c in keep_cols])
                 bars = bars.join(ticker_agg, on="bar_time", how="left")
+                # Do NOT fill_null(0) here — nulls are semantically important for OI/funding
 
-        # Join liquidations
+        # Join liquidations — notional = price * amount, split buy/sell
         if liqs is not None and len(liqs) > 0:
             liqs = liqs.with_columns(
                 pl.col("timestamp").dt.truncate(freq).alias("bar_time"),
-                pl.col("amount").alias("liq_amount"),
+                (pl.col("price") * pl.col("amount")).alias("liq_notional"),
+                (pl.col("side") == "buy").alias("liq_buy"),
             )
             liq_agg = (
                 liqs.group_by("bar_time")
                 .agg(
-                    liquidation_notional=pl.col("liq_amount").sum(),
+                    liquidation_buy_notional=pl.col("liq_notional").filter(pl.col("liq_buy")).sum(),
+                    liquidation_sell_notional=pl.col("liq_notional").filter(~pl.col("liq_buy")).sum(),
                     liquidation_count=pl.len(),
                 )
             )
             bars = bars.join(liq_agg, on="bar_time", how="left")
 
-        # Fill nulls for joined fields
-        bars = bars.fill_null(0).fill_nan(0)
+        # Only fill volume/taker fields that are naturally zero when no trades in the bar
+        # Ticker and liq fields stay null if no data
+        vol_cols = ["volume", "taker_buy_volume", "taker_sell_volume"]
+        bars = bars.with_columns([pl.col(c).fill_null(0) for c in vol_cols if c in bars.columns])
 
         return bars
 
     def _load_tardis_day_files(self, base_dir: Path, day: str) -> pl.DataFrame | None:
-        """Load all files for a given day from a raw tardis directory."""
+        """Load all files for a given day from a raw tardis directory.
+        Tardis CSVs use microsecond integer timestamps (epoch us), not strings.
+        We explicitly parse with from_epoch(time_unit='us').
+        """
         if not base_dir.exists():
             return None
         day_files = [f for f in base_dir.rglob("*") if day in f.name and f.suffix in (".csv", ".gz", ".parquet")]
@@ -401,7 +417,13 @@ class TardisDataClient:
                 if f.suffix == ".parquet" or "parquet" in f.name:
                     df = pl.read_parquet(f)
                 else:
-                    df = pl.read_csv(f, try_parse_dates=True)
+                    df = pl.read_csv(f)
+                # Convert microsecond epoch integers to datetime
+                for ts_col in ("timestamp", "local_timestamp"):
+                    if ts_col in df.columns:
+                        df = df.with_columns(
+                            pl.from_epoch(pl.col(ts_col), time_unit="us").alias(ts_col)
+                        )
                 frames.append(df)
             except Exception as e:
                 logger.warning("Failed to read %s: %s", f, e)
