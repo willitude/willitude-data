@@ -10,6 +10,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import polars as pl
+
 from .cache import CacheEntry, CacheManager
 from .config import get_config, get_tardis_cache_dir
 from .ssm import get_tardis_key
@@ -107,6 +109,8 @@ class TardisDataClient:
                             to_date=rend,
                             api_key=key,
                             download_dir=str(raw_dir.parent),
+                            timeout=300,
+                            concurrency=12,
                         )
                     except Exception as exc:
                         logger.warning("Tardis sub-range download issue for %s..%s: %s", rstart, rend, exc)
@@ -119,6 +123,8 @@ class TardisDataClient:
                                 to_date=rend,
                                 api_key=key,
                                 download_dir=str(raw_dir),
+                                timeout=300,
+                                concurrency=12,
                             )
                         except Exception as exc2:
                             logger.error("Tardis fallback also failed: %s", exc2)
@@ -216,3 +222,207 @@ class TardisDataClient:
                 has_files = any(f.is_file() for f in p.rglob("*"))
                 dtypes.append({"data_type": p.name, "has_files": has_files, "path": str(p)})
         return {"exchange": exchange, "symbol": symbol, "data_types": dtypes}
+
+    # ---------- Bars (aggregated time series) ----------
+    def ensure_tardis_bars(
+        self,
+        exchange: str,
+        symbols: list[str],
+        from_date: str,
+        to_date: str,
+        freq: str = "1m",
+        *,
+        data_types: list[str] | None = None,
+        keep_raw: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """
+        High-level: ensure raw data for trades + derivative_ticker + liquidations,
+        then build time-bar parquet files (OHLCV + vwap + taker flow + funding + OI + liquidations).
+
+        This is the recommended entry point for quant research because raw tick data is too large
+        to keep long-term. Bars are stored in a separate global cache (tardis_bars/) so the
+        symlink-to-project model remains disk-efficient.
+
+        freq: pandas offset alias (e.g. "1m", "5m", "1h")
+        keep_raw=False: delete raw after successful bar creation for the day (recommended for large campaigns)
+        """
+        if data_types is None:
+            data_types = ["trades", "derivative_ticker", "liquidations"]
+
+        # 1. Ensure the raw inputs (smart incremental)
+        raw_result = self.ensure_cached(
+            exchange=exchange,
+            symbols=symbols,
+            from_date=from_date,
+            to_date=to_date,
+            data_types=data_types,
+            force=force,
+        )
+
+        results = []
+        for symbol in symbols:
+            available = self.cache.get_tardis_bar_available_dates(exchange, symbol, freq)
+            missing = self.cache.compute_missing_dates(from_date, to_date, available)
+            if not missing and not force:
+                results.append({
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "freq": freq,
+                    "status": "cached",
+                    "missing_days": 0,
+                })
+                continue
+
+            ranges = self.cache.group_into_ranges(missing) if missing else [(from_date, to_date)]
+
+            for rstart, rend in ranges:
+                days = self.cache._date_range(rstart, rend)
+                for day in days:
+                    try:
+                        bar_df = self._build_bar_for_day(exchange, symbol, day, freq)
+                        if bar_df is not None and len(bar_df) > 0:
+                            out_path = self.cache.tardis_bar_path(exchange, symbol, freq, day)
+                            out_path.parent.mkdir(parents=True, exist_ok=True)
+                            bar_df.write_parquet(out_path, compression="zstd")
+
+                            if not keep_raw:
+                                # Clean raw for this day if requested
+                                self._cleanup_raw_for_day(exchange, symbol, data_types, day)
+
+                            results.append({
+                                "exchange": exchange,
+                                "symbol": symbol,
+                                "freq": freq,
+                                "day": day,
+                                "status": "built",
+                                "rows": len(bar_df),
+                            })
+                    except Exception as exc:
+                        logger.exception("Failed to build bar for %s %s %s %s", exchange, symbol, freq, day)
+                        results.append({
+                            "exchange": exchange,
+                            "symbol": symbol,
+                            "freq": freq,
+                            "day": day,
+                            "status": "error",
+                            "error": str(exc),
+                        })
+
+        return {
+            "provider": "tardis_bars",
+            "requested": {
+                "exchange": exchange,
+                "symbols": symbols,
+                "from_date": from_date,
+                "to_date": to_date,
+                "freq": freq,
+                "keep_raw": keep_raw,
+            },
+            "results": results,
+        }
+
+    def _build_bar_for_day(self, exchange: str, symbol: str, day: str, freq: str) -> pl.DataFrame | None:
+        """Build one day's bar dataframe from the three raw sources."""
+        # Load raw
+        trades_dir = self.cache.tardis_dir(exchange, symbol, "trades", raw=True)
+        ticker_dir = self.cache.tardis_dir(exchange, symbol, "derivative_ticker", raw=True)
+        liq_dir = self.cache.tardis_dir(exchange, symbol, "liquidations", raw=True)
+
+        trades = self._load_tardis_day_files(trades_dir, day)
+        ticker = self._load_tardis_day_files(ticker_dir, day)
+        liqs = self._load_tardis_day_files(liq_dir, day)
+
+        if trades is None or len(trades) == 0:
+            return None
+
+        # Basic trade -> bar
+        trades = trades.with_columns(
+            pl.col("timestamp").dt.truncate(freq).alias("bar_time"),
+            (pl.col("price") * pl.col("amount")).alias("notional"),
+            (pl.col("side") == "buy").cast(pl.Int64).alias("is_buy"),
+        )
+
+        bars = (
+            trades.group_by("bar_time")
+            .agg(
+                open=pl.col("price").first(),
+                high=pl.col("price").max(),
+                low=pl.col("price").min(),
+                close=pl.col("price").last(),
+                volume=pl.col("amount").sum(),
+                vwap=(pl.col("notional").sum() / pl.col("amount").sum()),
+                taker_buy_volume=pl.col("amount").filter(pl.col("is_buy")).sum(),
+                taker_sell_volume=pl.col("amount").filter(~pl.col("is_buy")).sum(),
+            )
+            .sort("bar_time")
+        )
+
+        # Join derivative_ticker (funding, oi, etc.) - forward fill within day
+        if ticker is not None and len(ticker) > 0:
+            ticker = ticker.with_columns(pl.col("timestamp").dt.truncate(freq).alias("bar_time"))
+            # Keep useful columns if present
+            keep_cols = [c for c in ticker.columns if c in ("funding_rate", "open_interest", "index_price", "mark_price")]
+            if keep_cols:
+                ticker_agg = ticker.group_by("bar_time").agg([pl.col(c).last() for c in keep_cols])
+                bars = bars.join(ticker_agg, on="bar_time", how="left")
+
+        # Join liquidations
+        if liqs is not None and len(liqs) > 0:
+            liqs = liqs.with_columns(
+                pl.col("timestamp").dt.truncate(freq).alias("bar_time"),
+                pl.col("amount").alias("liq_amount"),
+            )
+            liq_agg = (
+                liqs.group_by("bar_time")
+                .agg(
+                    liquidation_notional=pl.col("liq_amount").sum(),
+                    liquidation_count=pl.len(),
+                )
+            )
+            bars = bars.join(liq_agg, on="bar_time", how="left")
+
+        # Fill nulls for joined fields
+        bars = bars.fill_null(0).fill_nan(0)
+
+        return bars
+
+    def _load_tardis_day_files(self, base_dir: Path, day: str) -> pl.DataFrame | None:
+        """Load all files for a given day from a raw tardis directory."""
+        if not base_dir.exists():
+            return None
+        day_files = [f for f in base_dir.rglob("*") if day in f.name and f.suffix in (".csv", ".gz", ".parquet")]
+        if not day_files:
+            return None
+
+        frames = []
+        for f in sorted(day_files):
+            try:
+                if f.suffix == ".parquet" or "parquet" in f.name:
+                    df = pl.read_parquet(f)
+                else:
+                    df = pl.read_csv(f, try_parse_dates=True)
+                frames.append(df)
+            except Exception as e:
+                logger.warning("Failed to read %s: %s", f, e)
+        if not frames:
+            return None
+        return pl.concat(frames, how="diagonal_relaxed").sort("timestamp")
+
+    def _cleanup_raw_for_day(self, exchange: str, symbol: str, data_types: list[str], day: str):
+        """Delete raw files for a specific day (used when keep_raw=False)."""
+        for dtype in data_types:
+            raw_dir = self.cache.tardis_dir(exchange, symbol, dtype, raw=True)
+            for f in raw_dir.rglob("*"):
+                if day in f.name:
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
+            # Remove empty day dirs if any
+            try:
+                for p in sorted(raw_dir.rglob("*"), reverse=True):
+                    if p.is_dir() and not any(p.iterdir()):
+                        p.rmdir()
+            except Exception:
+                pass

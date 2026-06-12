@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -114,10 +116,12 @@ def get_cache_status() -> str:
 
 @mcp.tool(
     name="list_cached_data",
-    description="List detailed cached datasets. Filter with provider='tardis' or 'databento'.",
+    description="List detailed cached datasets. Filter with provider='tardis', 'databento' or 'tardis_bars'. Empty/zero-size entries (failed downloads) are filtered out by default to avoid ghost entries.",
 )
-def list_cached_data(provider: str | None = None) -> str:
+def list_cached_data(provider: str | None = None, include_empty: bool = False) -> str:
     items = _get_cache().list_cached(provider=provider)
+    if not include_empty:
+        items = [it for it in items if it.get("files", 0) > 0 or it.get("size_bytes", 0) > 0]
     return json.dumps({"count": len(items), "items": items}, indent=2, ensure_ascii=False)
 
 
@@ -126,8 +130,9 @@ def list_cached_data(provider: str | None = None) -> str:
     description=(
         "Ensure Tardis historical data (exchange/symbols/dates/data_types) is downloaded+cached. "
         "Reuses if present unless force=true. Returns paths to raw CSVs + unified.parquet (if enabled). "
-        "Ex: exchange='binance', symbols=['BTCUSDT'], data_types=['trades','incremental_book_L2'], "
-        "from_date='2024-01-01', to_date='2024-01-05'."
+        "Ex: exchange='binance-futures', symbols=['BTCUSDT'], data_types=['trades','incremental_book_L2'], "
+        "from_date='2024-01-01', to_date='2024-01-05'. "
+        "NOTE: For perps use 'binance-futures' (USDT-M) or 'binance-delivery' (COIN-M), not spot 'binance'."
     ),
 )
 async def ensure_tardis_data(
@@ -342,7 +347,8 @@ def register_project(project_root: str, name: str | None = None) -> str:
         "SMART INCREMENTAL: only missing days are downloaded (daily-aware cache). "
         "Does (1) smart ensure in global cache (2) symlinks/copies under project/data/raw/tardis/... + manifest. "
         "RULE: Use this for any rolling/ongoing campaign. After success use the 'project_paths' for relative loads. "
-        "Same params as ensure_tardis_data."
+        "Same params as ensure_tardis_data. "
+        "NOTE: For perpetuals use exchange='binance-futures' (USDT-M) or 'binance-delivery' (COIN-M), not 'binance' (spot)."
     ),
 )
 async def materialize_tardis_to_project(
@@ -488,6 +494,101 @@ async def materialize_databento_to_project(
 
 
 @mcp.tool(
+    name="materialize_tardis_bars_to_project",
+    description=(
+        "Materialize already-built Tardis bars into the current project as symlinks (or copies). "
+        "Use after ensure_tardis_bars. This is how you get clean relative paths like data/raw/tardis_bars/... "
+        "while the heavy bar data lives in the global cache."
+    ),
+)
+async def materialize_tardis_bars_to_project(
+    exchange: str,
+    symbols: list[str],
+    freq: str = "1m",
+    from_date: str | None = None,
+    to_date: str | None = None,
+    target_subdir: str = "data/raw",
+    use_symlinks: bool = True,
+    project_dir: str | None = None,
+    ctx: Context | None = None,
+) -> str:
+    if ctx:
+        await ctx.info(f"Materializing Tardis bars {exchange} {symbols} {freq} into project...")
+
+    proj = _resolve_project_dir(project_dir)
+    if not proj:
+        return json.dumps({"error": "No active project. Call register_project first."})
+
+    c = _get_cache()
+    materialized = []
+    for symbol in symbols:
+        bar_dir = c.tardis_bars_dir(exchange, symbol, freq)
+        if not bar_dir.exists():
+            continue
+        dest_dir = proj / target_subdir / "tardis_bars" / c._safe_name(exchange) / c._safe_name(symbol) / c._safe_name(freq)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        for src in sorted(bar_dir.glob("*.parquet")):
+            if from_date and src.stem < from_date:
+                continue
+            if to_date and src.stem > to_date:
+                continue
+            dest = dest_dir / src.name
+            if use_symlinks:
+                if dest.exists() or dest.is_symlink():
+                    dest.unlink()
+                os.symlink(src, dest)
+            else:
+                shutil.copy2(src, dest)
+            materialized.append(str(dest.relative_to(proj)))
+
+    return json.dumps({
+        "provider": "tardis_bars",
+        "project_dir": str(proj),
+        "materialized_count": len(materialized),
+        "example_paths": materialized[:3],
+    }, indent=2)
+
+
+@mcp.tool(
+    name="ensure_tardis_bars",
+    description=(
+        "PRIMARY TOOL for quant research. Downloads the necessary raw (trades + derivative_ticker + liquidations), "
+        "builds time-bar parquet (OHLCV + vwap + taker flow + funding + OI + liquidations) at the requested freq, "
+        "and stores the bars in the global cache (tardis_bars/). "
+        "This solves the disk problem: raw is tens of GB, 1m bars for same coverage is hundreds of MB. "
+        "keep_raw=False (default) deletes the raw after bar creation. "
+        "Supports the same smart missing-day resume as raw. "
+        "Example: ensure_tardis_bars(exchange='binance-futures', symbols=['BTCUSDT'], from_date='2024-01-01', to_date='2025-06-12', freq='1m')"
+    ),
+)
+async def ensure_tardis_bars(
+    exchange: str,
+    symbols: list[str],
+    from_date: str,
+    to_date: str,
+    freq: str = "1m",
+    keep_raw: bool = False,
+    force: bool = False,
+    ctx: Context | None = None,
+) -> str:
+    if ctx:
+        await ctx.info(f"Building Tardis bars {exchange} {symbols} {freq} {from_date}..{to_date} keep_raw={keep_raw}")
+
+    client = _get_tardis()
+    result = client.ensure_tardis_bars(
+        exchange=exchange,
+        symbols=symbols,
+        from_date=from_date,
+        to_date=to_date,
+        freq=freq,
+        keep_raw=keep_raw,
+        force=force,
+    )
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool(
     name="list_data_in_project",
     description="List what data has been materialized into a project (from its _willitude_manifest.json).",
 )
@@ -549,10 +650,11 @@ You are using the WillitudeData MCP server (Tardis crypto + Databento traditiona
    - Only after register_project succeeds should you call materialize tools.
    - If no project context and user wants data "for this work", ask for the project path and register it.
 
-2. **Preferred Tool = materialize_*_to_project (not the low-level ensure)**
-   - When the user wants data for analysis/backtesting/research inside a folder → ALWAYS prefer `materialize_tardis_to_project` or `materialize_databento_to_project`.
-   - These tools do "ensure in global cache + bring into project as symlinks + write manifest" atomically.
-   - Only fall back to ensure_*_data if the user explicitly says "just populate the global cache, don't touch my project" or "I don't want it in the folder yet".
+2. **Preferred Tool for research = ensure_tardis_bars + materialize_tardis_bars_to_project**
+   - Raw ticks are huge (tens of GB). For actual quant work (backtests, panels, models) ALWAYS use the bar layer first.
+   - Call ensure_tardis_bars(..., freq="1m", keep_raw=False) → this builds compact OHLCV+derived bars in global cache and optionally discards raw.
+   - Then materialize_tardis_bars_to_project(...) to get symlinks in the project with clean relative paths.
+   - Fall back to raw materialize only when user explicitly needs tick-level data.
 
 3. **After materialize success**
    - Look at the returned JSON.
@@ -576,11 +678,12 @@ When user says something like "get me Binance BTC L2 for Jan-Feb in my alpha pro
 
 A. Call register_project with the correct absolute path (if not already registered this session).
 B. Call get_cache_status() or list_data_in_project() to see what already exists.
-C. Call the appropriate materialize_*_to_project with precise parameters.
+C. For real research: Call ensure_tardis_bars(...) (with keep_raw=False) then materialize_tardis_bars_to_project(...).
+   For raw ticks (rare): use the raw materialize tools.
 D. On success:
-   - Show the user the relative paths from "project_paths".
-   - Offer ready-to-paste Polars (or Pandas/DuckDB) loading code.
-   - Optionally call load_cached_preview on one of the new paths for a quick sanity check.
+   - Show the user the relative paths from "project_paths" (or from the bars materialize result).
+   - Offer ready-to-paste Polars loading code.
+   - Optionally call load_cached_preview on one of the new paths.
 E. If user later asks "what data did we use for this backtest?", call list_data_in_project() and surface the manifest.
 
 === OTHER USEFUL TOOLS ===

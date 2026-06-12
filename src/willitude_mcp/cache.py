@@ -150,6 +150,31 @@ class CacheManager:
                                     "path": str(sch),
                                 }
                             )
+        if provider in (None, "tardis_bars"):
+            bars_root = get_tardis_cache_dir().parent / "tardis_bars"
+            if bars_root.exists():
+                for exch in sorted(bars_root.iterdir()):
+                    if not exch.is_dir():
+                        continue
+                    for sym in sorted(exch.iterdir()):
+                        if not sym.is_dir():
+                            continue
+                        for fr in sorted(sym.iterdir()):
+                            if not fr.is_dir():
+                                continue
+                            files = [f for f in fr.iterdir() if f.is_file()]
+                            total = sum(f.stat().st_size for f in files)
+                            results.append(
+                                {
+                                    "provider": "tardis_bars",
+                                    "exchange": exch.name,
+                                    "symbol": sym.name,
+                                    "freq": fr.name,
+                                    "files": len(files),
+                                    "size_bytes": total,
+                                    "path": str(fr),
+                                }
+                            )
         return results
 
     def get_size_summary(self) -> dict[str, Any]:
@@ -230,6 +255,25 @@ class CacheManager:
                             cur += timedelta(days=1)
                     except Exception:
                         pass
+        return dates
+
+    # ---------- Tardis Bars (aggregated OHLCV + derived metrics) ----------
+    def tardis_bars_dir(self, exchange: str, symbol: str, freq: str) -> Path:
+        """Directory for bar parquet files (daily partitioned recommended)."""
+        d = get_tardis_cache_dir().parent / "tardis_bars" / self._safe(exchange) / self._safe(symbol) / self._safe(freq)
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def tardis_bar_path(self, exchange: str, symbol: str, freq: str, day: str) -> Path:
+        return self.tardis_bars_dir(exchange, symbol, freq) / f"{day}.parquet"
+
+    def get_tardis_bar_available_dates(self, exchange: str, symbol: str, freq: str) -> set[str]:
+        d = self.tardis_bars_dir(exchange, symbol, freq)
+        dates: set[str] = set()
+        for f in d.glob("*.parquet"):
+            m = self.DATE_RE.search(f.stem)
+            if m:
+                dates.add(m.group(1))
         return dates
 
     def _date_range(self, from_date: str, to_date: str) -> list[str]:
