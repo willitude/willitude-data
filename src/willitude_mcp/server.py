@@ -60,19 +60,23 @@ def get_user_context(ctx: Context) -> dict:
                 v = headers.get(k.lower())
             return v
         return headers.get(k) if isinstance(headers, dict) else None
+    transport = "http" if request is not None else "stdio"
     return {
         "user_id": get_h("x-user-id"),
         "role": get_h("x-user-role") or "unknown",
         "team": get_h("x-team"),
+        "transport": transport,
     }
 
 
 def require_role(user: dict, allowed: set[str]):
     role = user.get("role", "unknown")
-    if role == "unknown":
-        return  # stdio local mode or unauthenticated local use: bypass role check
-    if role not in allowed:
-        raise PermissionError(f"Role '{role}' not authorized for this operation. Allowed: {allowed}")
+    transport = user.get("transport", "stdio")
+    if transport == "stdio":
+        return  # local stdio: bypass (fail-open only for local)
+    # HTTP/remote: fail-closed. Unknown or missing role means auth failed -> deny.
+    if role == "unknown" or role not in allowed:
+        raise PermissionError(f"Role '{role}' not authorized for HTTP transport. Allowed: {allowed}")
 
 
 mcp = FastMCP(

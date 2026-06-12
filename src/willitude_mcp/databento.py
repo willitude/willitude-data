@@ -63,11 +63,13 @@ class DatabentoDataClient:
             if not missing and not force:
                 logger.info("Databento cache hit (all days present): %s %s %s %s..%s", dataset, symbol, schema, start, end)
                 if self.cache.is_s3():
-                    # one-time backfill to S3 for existing local cache
+                    # one-time backfill to S3 for existing local cache; skip if already in S3
                     for day in self.cache._date_range(start, end):
                         daily_path = self.cache.databento_daily_path(dataset, symbol, schema, day)
                         if daily_path.exists():
-                            self.cache.upload_to_s3(daily_path, self.cache.s3_databento_key(dataset, symbol, schema, day))
+                            s3_key = self.cache.s3_databento_key(dataset, symbol, schema, day)
+                            if force or not self.cache.s3_object_exists(s3_key):
+                                self.cache.upload_to_s3(daily_path, s3_key)
                 results.append(
                     {
                         "dataset": dataset,
@@ -92,11 +94,12 @@ class DatabentoDataClient:
             if not missing and not force:
                 logger.info("Databento cache hit (restored from S3): %s %s %s %s..%s", dataset, symbol, schema, start, end)
                 if self.cache.is_s3():
-                    # backfill any local days that S3 didn't have? but since restored, upload the days we just pulled
                     for day in self.cache._date_range(start, end):
                         daily_path = self.cache.databento_daily_path(dataset, symbol, schema, day)
                         if daily_path.exists():
-                            self.cache.upload_to_s3(daily_path, self.cache.s3_databento_key(dataset, symbol, schema, day))
+                            s3_key = self.cache.s3_databento_key(dataset, symbol, schema, day)
+                            if force or not self.cache.s3_object_exists(s3_key):
+                                self.cache.upload_to_s3(daily_path, s3_key)
                 results.append(
                     {
                         "dataset": dataset,

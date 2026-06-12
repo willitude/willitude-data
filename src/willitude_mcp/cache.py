@@ -145,6 +145,32 @@ class CacheManager:
                 except Exception as e:
                     logger.warning(f"Failed S3 download for {key}: {e}")
 
+    def s3_object_exists(self, s3_key: str) -> bool:
+        """Check if a specific S3 object exists (for skipping re-uploads on cache hits)."""
+        if not self.is_s3():
+            return False
+        try:
+            import boto3
+            cfg = get_config()
+            s3 = boto3.client("s3", region_name=cfg.s3_region)
+            s3.head_object(Bucket=cfg.s3_cache_bucket, Key=s3_key)
+            return True
+        except Exception:
+            return False
+
+    def s3_prefix_exists(self, s3_prefix: str) -> bool:
+        """Check if any objects exist under the prefix (for raw dir backfill decision)."""
+        if not self.is_s3():
+            return False
+        try:
+            import boto3
+            cfg = get_config()
+            s3 = boto3.client("s3", region_name=cfg.s3_region)
+            resp = s3.list_objects_v2(Bucket=cfg.s3_cache_bucket, Prefix=s3_prefix, MaxKeys=1)
+            return 'Contents' in resp and len(resp.get('Contents', [])) > 0
+        except Exception:
+            return False
+
     # ---------- Tardis ----------
     def tardis_dir(self, exchange: str, symbol: str, data_type: str, *, raw: bool = True) -> Path:
         base = get_tardis_cache_dir() / self._safe(exchange) / self._safe(symbol) / self._safe(data_type)
