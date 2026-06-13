@@ -115,6 +115,7 @@ class DatabentoDataClient:
             if force:
                 missing = self.cache._date_range(start, end)
 
+            had_missing_after_s3 = len(missing) > 0
             logger.info(
                 "Databento smart fetch: %s %s %s %s..%s — %d missing days",
                 dataset, symbol, schema, start, end, len(missing)
@@ -125,6 +126,7 @@ class DatabentoDataClient:
 
             downloaded_paths = []
             total_size = 0
+            fetch_errors = []
 
             for rstart, rend in ranges:
                 try:
@@ -178,9 +180,28 @@ class DatabentoDataClient:
 
                 except Exception as exc:
                     logger.exception("Databento block fetch failed for %s %s %s %s..%s", dataset, symbol, schema, rstart, rend)
+                    fetch_errors.append(f"{rstart}..{rend}: {str(exc)}")
                     # continue with other blocks
 
-            if self.cache.is_s3():
+            if had_missing_after_s3 and len(downloaded_paths) == 0:
+                err = "; ".join(fetch_errors) if fetch_errors else "No data fetched for the requested missing days (e.g. payment issue or provider error)"
+                results.append(
+                    {
+                        "dataset": dataset,
+                        "symbol": symbol,
+                        "schema": schema,
+                        "status": "failed",
+                        "error": err,
+                        "missing_days": len(missing),
+                        "fetched_ranges": ranges,
+                        "daily_files": 0,
+                        "path": str(self.cache.databento_dir(dataset, symbol, schema)),
+                    }
+                )
+                # do not upload or record manifest on total failure
+                continue
+
+            if self.cache.is_s3() and len(downloaded_paths) > 0:
                 dir_path = self.cache.databento_dir(dataset, symbol, schema)
                 s3_prefix = self.cache.s3_databento_key(dataset, symbol, schema)
                 self.cache.upload_to_s3(dir_path, s3_prefix)
