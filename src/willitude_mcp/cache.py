@@ -81,6 +81,114 @@ class CacheManager:
         prefix = get_config().s3_cache_prefix
         return f"{prefix}/tardis_bars/{self._safe(exchange)}/{self._safe(symbol)}/{self._safe(freq)}/{day}.parquet"
 
+    def estimate_last_tardis_available(self) -> str:
+        """Estimate based on Tardis publication rule: previous day's data published ~06:00 UTC."""
+        now = datetime.now(UTC)
+        cutoff = now.replace(hour=6, minute=0, second=0, microsecond=0)
+        if now < cutoff:
+            last = (now - timedelta(days=1)).date()
+        else:
+            last = now.date()
+        return last.isoformat()
+
+    def get_tardis_bar_symbols(self, exchange: str) -> list[str]:
+        """List symbols with bars for the exchange, from local or S3."""
+        if self.is_s3():
+            prefix = f"{get_config().s3_cache_prefix}/tardis_bars/{self._safe(exchange)}/"
+            try:
+                import boto3
+                cfg = get_config()
+                s3 = boto3.client("s3", region_name=cfg.s3_region)
+                symbols = set()
+                paginator = s3.get_paginator('list_objects_v2')
+                for page in paginator.paginate(Bucket=cfg.s3_cache_bucket, Prefix=prefix, Delimiter='/'):
+                    for cp in page.get('CommonPrefixes', []):
+                        sym = cp['Prefix'][len(prefix):].rstrip('/')
+                        if sym:
+                            symbols.add(sym)
+                return sorted(symbols)
+            except Exception:
+                return []
+        else:
+            bars_root = get_tardis_cache_dir().parent / "tardis_bars" / self._safe(exchange)
+            if not bars_root.exists():
+                return []
+            return sorted([p.name for p in bars_root.iterdir() if p.is_dir()])
+
+    def get_tardis_symbols(self, exchange: str) -> list[str]:
+        """List symbols with any raw data for the exchange, from local or S3."""
+        if self.is_s3():
+            prefix = f"{get_config().s3_cache_prefix}/tardis/{self._safe(exchange)}/"
+            try:
+                import boto3
+                cfg = get_config()
+                s3 = boto3.client("s3", region_name=cfg.s3_region)
+                symbols = set()
+                paginator = s3.get_paginator('list_objects_v2')
+                for page in paginator.paginate(Bucket=cfg.s3_cache_bucket, Prefix=prefix, Delimiter='/'):
+                    for cp in page.get('CommonPrefixes', []):
+                        sym = cp['Prefix'][len(prefix):].rstrip('/')
+                        if sym:
+                            symbols.add(sym)
+                return sorted(symbols)
+            except Exception:
+                return []
+        else:
+            root = get_tardis_cache_dir() / self._safe(exchange)
+            if not root.exists():
+                return []
+            return sorted([p.name for p in root.iterdir() if p.is_dir()])
+
+    def get_latest_tardis_raw_date(self, exchange: str, symbol: str, data_type: str) -> str | None:
+        """Latest date from raw files for symbol/data_type, local or S3."""
+        if self.is_s3():
+            prefix = self.s3_tardis_key(exchange, symbol, data_type, raw=True) + "/"
+            try:
+                import boto3
+                cfg = get_config()
+                s3 = boto3.client("s3", region_name=cfg.s3_region)
+                dates = set()
+                paginator = s3.get_paginator('list_objects_v2')
+                for page in paginator.paginate(Bucket=cfg.s3_cache_bucket, Prefix=prefix):
+                    for obj in page.get('Contents', []):
+                        m = self.DATE_RE.search(obj['Key'])
+                        if m:
+                            dates.add(m.group(1))
+                return max(dates) if dates else None
+            except Exception:
+                return None
+        else:
+            base = self.tardis_dir(exchange, symbol, data_type, raw=True)
+            dates = set()
+            for f in base.rglob("*"):
+                m = self.DATE_RE.search(f.name)
+                if m:
+                    dates.add(m.group(1))
+            return max(dates) if dates else None
+
+    def get_latest_tardis_bar_date(self, exchange: str, symbol: str, freq: str) -> str | None:
+        """Latest cached bar date for symbol/freq, from local or S3 (no provider call)."""
+        if self.is_s3():
+            prefix = self.s3_tardis_bar_key(exchange, symbol, freq, "0000-00-00").rsplit("/", 1)[0] + "/"
+            try:
+                import boto3
+                cfg = get_config()
+                s3 = boto3.client("s3", region_name=cfg.s3_region)
+                dates = set()
+                paginator = s3.get_paginator('list_objects_v2')
+                for page in paginator.paginate(Bucket=cfg.s3_cache_bucket, Prefix=prefix):
+                    for obj in page.get('Contents', []):
+                        m = self.DATE_RE.search(obj['Key'])
+                        if m:
+                            dates.add(m.group(1))
+                return max(dates) if dates else None
+            except Exception:
+                return None
+        else:
+            d = self.tardis_bars_dir(exchange, symbol, freq)
+            dates = sorted(f.stem for f in d.glob("*.parquet"))
+            return dates[-1] if dates else None
+
     def upload_to_s3(self, local_path: Path, s3_key: str) -> None:
         if not self.is_s3() or not local_path.exists():
             return

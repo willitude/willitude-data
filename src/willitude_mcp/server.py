@@ -25,7 +25,7 @@ from pathlib import Path
 from mcp.server.fastmcp import Context, FastMCP
 
 from .cache import CacheManager
-from .config import get_config
+from .config import get_config, get_tardis_cache_dir
 from .databento import DatabentoDataClient
 from .ssm import get_key_provider
 from .tardis import TardisDataClient
@@ -169,6 +169,54 @@ def list_cached_data(provider: str | None = None, include_empty: bool = False) -
     if not include_empty:
         items = [it for it in items if it.get("files", 0) > 0 or it.get("size_bytes", 0) > 0]
     return json.dumps({"count": len(items), "items": items}, indent=2, ensure_ascii=False)
+
+
+@mcp.tool(
+    name="get_freshness",
+    description=(
+        "One-glance freshness summary for deciding panel extensions WITHOUT risking quota or API calls. "
+        "Returns per symbol: last_cached_date (from global cache index, local or S3), "
+        "last_available_date_estimate (based on Tardis ~06:00 UTC previous-day publication rule). "
+        "Ideal for weekly real-OOS panel tracking: 'can I safely extend to today?' "
+        "datatype: freq like '1m' for bars (default), or raw data_type. "
+        "If symbols=None, scans available for the exchange in the cache. "
+        "No external provider calls."
+    ),
+)
+def get_freshness(exchange: str, symbols: list[str] | None = None, datatype: str | None = None) -> str:
+    c = _get_cache()
+    if datatype is None:
+        datatype = "1m"  # default for panels/bars
+    # Heuristic: if looks like frequency, treat as bars
+    is_bar = datatype in ["1m", "5m", "15m", "1h", "1d"] or datatype.endswith(("m", "h", "d"))
+    if symbols is None:
+        symbols = c.get_tardis_bar_symbols(exchange) if is_bar else c.get_tardis_symbols(exchange)
+    result = {}
+    for sym in symbols:
+        if is_bar:
+            last_cached = c.get_latest_tardis_bar_date(exchange, sym, datatype)
+        else:
+            last_cached = c.get_latest_tardis_raw_date(exchange, sym, datatype) if hasattr(c, "get_latest_tardis_raw_date") else None
+            # Fallback simple scan if no dedicated method
+            if last_cached is None:
+                raw_base = get_tardis_cache_dir() / c._safe(exchange) / c._safe(sym)
+                if raw_base.exists():
+                    dates = set()
+                    for p in raw_base.iterdir():
+                        if p.is_dir():
+                            for f in p.rglob("*"):
+                                m = c.DATE_RE.search(f.name)
+                                if m:
+                                    dates.add(m.group(1))
+                    last_cached = max(dates) if dates else None
+        last_avail = c.estimate_last_tardis_available()
+        result[sym] = {
+            "last_cached_date": last_cached,
+            "last_available_date_estimate": last_avail,
+            "datatype": datatype,
+            "note": "last_available based on Tardis publication ~06:00 UTC for previous day. Use to decide safe extension without calling ensure."
+        }
+    return json.dumps(result, indent=2, ensure_ascii=False)
 
 
 @mcp.tool(
@@ -720,6 +768,7 @@ You are using the WillitudeData MCP server (Tardis crypto + Databento traditiona
    - Call ensure_tardis_bars(..., freq="1m", keep_raw=False) → this builds compact OHLCV+derived bars in global cache and optionally discards raw.
    - Then materialize_tardis_bars_to_project(...) to get symlinks in the project with clean relative paths.
    - Fall back to raw materialize only when user explicitly needs tick-level data.
+   - Use get_freshness(...) FIRST to decide if extension is safe (no quota risk, instant local/S3 index check + publication estimate).
 
 3. **After materialize success**
    - Look at the returned JSON.
@@ -743,7 +792,8 @@ When user says something like "get me Binance BTC L2 for Jan-Feb in my alpha pro
 
 A. Call register_project with the correct absolute path (if not already registered this session).
 B. Call get_cache_status() or list_data_in_project() to see what already exists.
-C. For real research: Call ensure_tardis_bars(...) (with keep_raw=False) then materialize_tardis_bars_to_project(...).
+C. For real research: FIRST call get_freshness(exchange, symbols, datatype="1m") to check if safe to extend without quota hit.
+   Then if needed: ensure_tardis_bars(...) (keep_raw=False) + materialize_tardis_bars_to_project(...).
    For raw ticks (rare): use the raw materialize tools.
 D. On success:
    - Show the user the relative paths from "project_paths" (or from the bars materialize result).
@@ -753,6 +803,7 @@ E. If user later asks "what data did we use for this backtest?", call list_data_
 
 === OTHER USEFUL TOOLS ===
 
+- get_freshness(exchange, symbols?, datatype="1m") → FIRST tool for panel extension decisions. Instant local/S3 index + Tardis publication estimate. No quota risk.
 - get_data_paths(...) → use when you need the original global cache location or to double-check.
 - load_cached_preview(path, limit=8) → fast schema + sample without leaving the chat.
 - list_data_in_project() / create_data_manifest() → for auditing.
